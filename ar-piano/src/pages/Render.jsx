@@ -20,14 +20,75 @@ const JPEG_Q      = 0.5;
 const FLIP_X = false;
 
 // ── VR (split-screen stereo) tuning ───────────────────────────────────────────
-// Always-on. Phone is HORIZONTAL in the headset: the centre of the frame is
-// cropped and drawn into a left + right half (one per eye).
-//   VR_ZOOM 1.0 = largest centre crop that fills each eye (square-ish, so the
-//                 far edges of a wide keyboard get cut — inherent to a landscape
-//                 phone split in two). >1.0 zooms in further.
-//   EYE_GAP    = px of black divider between the two eyes (0 = none).
 const VR_ZOOM = 1.0;
 const EYE_GAP = 0;
+
+// ── Tutorial (falling-notes) tuning ───────────────────────────────────────────
+//   TUT_COUNTDOWN_S   — seconds counted down (on the UI) before notes start.
+//   TUT_FALL_MS       — time for one block to fall from the "sky" onto its key.
+//   TUT_STEP_MS       — gap between successive notes spawning (pacing knob).
+//   TUT_HIT_WINDOW_MS — after a note lands, how long the player has to hit the
+//                       correct key for it to count as a hit (1 s as requested).
+//   TUT_FEEDBACK_MS   — how long the green (hit) / red (miss) key flash shows.
+//   TUT_LIFT_FRAC     — how high (fraction of one eye's height) a block starts.
+const TUT_COUNTDOWN_S   = 10;
+const TUT_FALL_MS       = 2000;
+const TUT_STEP_MS       = 1300;
+const TUT_HIT_WINDOW_MS = 1000;
+const TUT_FEEDBACK_MS   = 700;
+const TUT_LIFT_FRAC     = 0.55;
+
+// Twinkle Twinkle Little Star (white-key letters, ascends within one octave)
+const MELODY = [
+  "C", "C", "G", "G", "A", "A", "G",
+  "F", "F", "E", "E", "D", "D", "C",
+  "G", "G", "F", "F", "E", "E", "D",
+  "G", "G", "F", "F", "E", "E", "D",
+  "C", "C", "G", "G", "A", "A", "G",
+  "F", "F", "E", "E", "D", "D", "C",
+];
+
+// white-key offset from the octave's C (diatonic, no black keys)
+const WHITE_OFFSET = { C: 0, D: 1, E: 2, F: 3, G: 4, A: 5, B: 6 };
+
+// noteLetter(k) -> bare uppercase letter. Strips any octave digit / accidental.
+function whiteKeyLetter(k) {
+  const s = String(noteLetter(k)).toUpperCase().replace(/[^A-G]/g, "");
+  return s.charAt(0) || "C";
+}
+
+// nearest C to the keyboard centre, shifted so the whole C..A span stays on-board
+function findBaseC() {
+  let best = null, bestDist = Infinity;
+  for (let k = -RANGE; k < RANGE; k++) {
+    if (whiteKeyLetter(k) === "C") {
+      const d = Math.abs(k);
+      if (d < bestDist) { bestDist = d; best = k; }
+    }
+  }
+  if (best === null) best = 0;
+  while (best + 5 > RANGE - 1) best -= 7;
+  while (best < -RANGE)       best += 7;
+  return best;
+}
+
+// turn the melody into a list of key indices (re-centres on the layout each run)
+function buildMelodyKeys() {
+  const base = findBaseC();
+  return MELODY.map((n) => base + (WHITE_OFFSET[n] ?? 0));
+}
+
+// rounded-rect path helper (screen space) for the falling note blocks
+function roundRectPath(ctx, x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w / 2, h / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y,     x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x,     y + h, r);
+  ctx.arcTo(x,     y + h, x,     y,     r);
+  ctx.arcTo(x,     y,     x + w, y,     r);
+  ctx.closePath();
+}
 
 // MediaPipe 21-point hand skeleton connections
 const HAND_CONNECTIONS = [
@@ -104,9 +165,56 @@ export default function Render() {
   const lastMsgRef  = useRef(null);
   const pressedRef  = useRef({});   // finger -> key index currently sounding (edge detect)
 
+  // ── TUTORIAL state (refs read by the render loop; the loop closure is created
+  //    once, so these can't be useState) ──
+  const tutorialActiveRef = useRef(false);
+  const tutorialStartRef  = useRef(0);
+  const fallingNotesRef   = useRef([]);   // [{note,keyId,startTime,duration,progress,result,resultTime}]
+  const countdownRef      = useRef(null); // setInterval id for the pre-roll countdown
+
   const [ping,      setPing]      = useState(null);
   const [connected, setConnected] = useState(false);
   const [started,   setStarted]   = useState(false);
+  const [countdown, setCountdown] = useState(null);   // null | 10..1 (UI display)
+
+  // build the falling-note timeline and arm the tutorial
+  const startTutorial = () => {
+    const keys = buildMelodyKeys();
+    const t0   = performance.now();
+    fallingNotesRef.current = keys.map((keyId, i) => ({
+      note:       MELODY[i],
+      keyId,
+      startTime:  t0 + i * TUT_STEP_MS,
+      duration:   TUT_FALL_MS,
+      progress:   0,
+      result:     null,   // null while in play, then "hit" / "miss"
+      resultTime: 0,
+    }));
+    tutorialActiveRef.current = true;
+    tutorialStartRef.current  = t0;
+  };
+
+  // UI button -> 10s countdown -> startTutorial(). Restart-safe.
+  const beginCountdown = () => {
+    if (countdownRef.current) clearInterval(countdownRef.current);
+    tutorialActiveRef.current = false;     // stop any running tutorial first
+    fallingNotesRef.current   = [];
+    setCountdown(TUT_COUNTDOWN_S);
+    countdownRef.current = setInterval(() => {
+      setCountdown((c) => {
+        if (c === null) return null;
+        if (c <= 1) {
+          clearInterval(countdownRef.current);
+          countdownRef.current = null;
+          startTutorial();
+          return null;
+        }
+        return c - 1;
+      });
+    }, 1000);
+  };
+
+  useEffect(() => () => { if (countdownRef.current) clearInterval(countdownRef.current); }, []);
 
   // ── WebSocket ───────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -187,9 +295,8 @@ export default function Render() {
       const msg = lastMsgRef.current;
 
       // ── LOGIC (ONCE, in SEND-frame coords): homography + hit-test + sound ────
-      // Display-independent, so the two eyes never double-fire a note.
       let H = null, projS = null;
-      const activeKeys = new Set();
+      const activeKeys = new Set();   // keys the player is pressing RIGHT NOW
       if (msg?.found && msg.marker) {
         const mc = msg.marker.corners;   // [[x,y]*4] in SEND px
 
@@ -219,7 +326,7 @@ export default function Render() {
           };
 
           // PLAY RULE: a key sounds only when the SAME finger is inside the key
-          // region AND its FSR registers a tap.
+          // region AND its FSR registers a tap. This is the ONLY source of sound.
           const fingers = msg.fingers || {};
           const fsr     = msg.fsr || {};
           const nowKey  = {};
@@ -249,8 +356,50 @@ export default function Render() {
         for (const name of ALL_FINGERS) pressedRef.current[name] = null;
       }
 
+      // ── TUTORIAL frame state (display-independent: time + refs only) ──────────
+      // Blocks fall, then DISAPPEAR on impact (no sound). When a note lands, the
+      // player has TUT_HIT_WINDOW_MS to press that key: in time -> green (hit),
+      // otherwise -> red (miss). Judging happens once per note, then the key
+      // flashes its result for TUT_FEEDBACK_MS.
+      const tutTargets = new Set();   // keys with a block currently falling toward them (glow)
+      const tutHit     = new Set();   // keys to flash green
+      const tutMiss    = new Set();   // keys to flash red
+      const tutNotes   = [];          // falling blocks to draw {keyId, progress}
+      if (tutorialActiveRef.current) {
+        const now  = performance.now();
+        const list = fallingNotesRef.current;
+        for (const fn of list) {
+          const elapsed = now - fn.startTime;
+          if (elapsed < 0) continue;                  // not spawned yet
+          if (elapsed <= fn.duration) {               // still falling
+            fn.progress = elapsed / fn.duration;
+            tutNotes.push({ keyId: fn.keyId, progress: fn.progress });
+            tutTargets.add(fn.keyId);
+            continue;
+          }
+          // landed: block is gone. Judge timing within the hit window.
+          const landTime = fn.startTime + fn.duration;
+          if (fn.result === null) {
+            if (activeKeys.has(fn.keyId)) {            // correct key pressed in time
+              fn.result = "hit";  fn.resultTime = now;
+            } else if (now > landTime + TUT_HIT_WINDOW_MS) {
+              fn.result = "miss"; fn.resultTime = now;
+            }
+          }
+          if (fn.result && now <= fn.resultTime + TUT_FEEDBACK_MS) {
+            (fn.result === "hit" ? tutHit : tutMiss).add(fn.keyId);
+          }
+        }
+        const lastn = list[list.length - 1];
+        if (lastn) {
+          const done = lastn.startTime + lastn.duration
+                     + TUT_HIT_WINDOW_MS + TUT_FEEDBACK_MS + 300;
+          if (now > done) { tutorialActiveRef.current = false; fallingNotesRef.current = []; }
+        }
+      }
+
       // ── DRAW: two viewports, left eye + right eye ───────────────────────────
-      const half = canvas.width / 2;        // exact integer (width forced even)
+      const half = canvas.width / 2;
       const viewports = [
         { x: 0,                y: 0, w: half - EYE_GAP/2, h: canvas.height },
         { x: half + EYE_GAP/2, y: 0, w: half - EYE_GAP/2, h: canvas.height },
@@ -260,7 +409,6 @@ export default function Render() {
         const crop = centerCropForViewport(vp, VR_ZOOM);
         const pl   = placeCover(vp, crop);
 
-        // SEND px → display px for THIS viewport
         const T = (sx, sy) => {
           let X = pl.dx + (sx - crop.x) * pl.scale;
           const Y = pl.dy + (sy - crop.y) * pl.scale;
@@ -270,7 +418,7 @@ export default function Render() {
 
         // cropped camera into this eye
         {
-          const k  = natW / SEND_WIDTH;   // SEND→native (same AR both axes)
+          const k  = natW / SEND_WIDTH;
           const sX = crop.x * k, sY = crop.y * k, sW = crop.w * k, sH = crop.h * k;
           ctx.save();
           ctx.beginPath(); ctx.rect(vp.x, vp.y, vp.w, vp.h); ctx.clip();
@@ -279,11 +427,10 @@ export default function Render() {
           ctx.restore();
         }
 
-        // clip overlay so the halves never bleed into each other
         ctx.save();
         ctx.beginPath(); ctx.rect(vp.x, vp.y, vp.w, vp.h); ctx.clip();
 
-        // ── white keys (highlight active) ─────────────────────────────────────
+        // ── white keys (active press / falling target / hit / miss) ───────────
         if (H && projS) {
           for (let k = -RANGE; k < RANGE; k++) {
             const a = projS(uL(k), V_TOP), b = projS(uR(k), V_TOP);
@@ -293,9 +440,18 @@ export default function Render() {
             ctx.beginPath();
             ctx.moveTo(A[0],A[1]); ctx.lineTo(B[0],B[1]);
             ctx.lineTo(C[0],C[1]); ctx.lineTo(D[0],D[1]); ctx.closePath();
-            ctx.fillStyle   = activeKeys.has(k) ? "rgba(90,200,255,0.95)"
-                                                : "rgba(255,255,255,0.9)";
+
+            let fill = "rgba(255,255,255,0.9)";
+            let glow = null;
+            if      (tutHit.has(k))     { fill = "rgba(90,220,120,0.96)"; glow = "rgba(90,220,120,0.9)"; }
+            else if (tutMiss.has(k))    { fill = "rgba(245,90,90,0.96)";  glow = "rgba(245,90,90,0.9)"; }
+            else if (tutTargets.has(k)) { fill = "rgba(255,225,90,0.95)"; glow = "rgba(255,210,60,0.9)"; }
+            else if (activeKeys.has(k)) { fill = "rgba(90,200,255,0.95)"; }
+
+            if (glow) { ctx.shadowColor = glow; ctx.shadowBlur = 14; }
+            ctx.fillStyle = fill;
             ctx.fill();
+            ctx.shadowBlur  = 0;
             ctx.strokeStyle = "rgba(20,30,40,0.85)";
             ctx.lineWidth   = 1.5;
             ctx.stroke();
@@ -314,6 +470,44 @@ export default function Render() {
           }
         }
 
+        // ── TUTORIAL: falling note blocks (above each target key, descending,
+        //    then they vanish on impact — no resting block, no sound) ──────────
+        if (H && projS) {
+          for (const tn of tutNotes) {
+            const k = tn.keyId;
+            const a = projS(uL(k), V_TOP), b = projS(uR(k), V_TOP),
+                  c = projS(uR(k), V_BOT), d = projS(uL(k), V_BOT);
+            if (!a || !b || !c || !d) continue;
+            const A=T(a[0],a[1]), B=T(b[0],b[1]), C=T(c[0],c[1]), D=T(d[0],d[1]);
+            const cx = (A[0]+B[0]+C[0]+D[0]) / 4;
+            const cy = (A[1]+B[1]+C[1]+D[1]) / 4;
+            const wAvg = (Math.hypot(B[0]-A[0],B[1]-A[1]) + Math.hypot(C[0]-D[0],C[1]-D[1])) / 2;
+            const hAvg = (Math.hypot(D[0]-A[0],D[1]-A[1]) + Math.hypot(C[0]-B[0],C[1]-B[1])) / 2;
+            const blockW = wAvg * 0.78;
+            const blockH = Math.max(10, hAvg * 0.42);
+
+            const lift = TUT_LIFT_FRAC * vp.h * (1 - tn.progress);
+            const by   = cy - lift;   // smaller y = higher on screen = "sky"
+
+            ctx.save();
+            ctx.shadowColor = "rgba(255,140,30,0.9)";
+            ctx.shadowBlur  = 16;
+            roundRectPath(ctx, cx - blockW/2, by - blockH/2, blockW, blockH,
+                          Math.min(blockW, blockH) * 0.28);
+            ctx.fillStyle   = "rgba(255,120,20,0.96)";
+            ctx.fill();
+            ctx.lineWidth   = 2;
+            ctx.strokeStyle = "rgba(255,255,255,0.92)";
+            ctx.stroke();
+            ctx.restore();
+
+            ctx.font = `bold ${Math.max(10, Math.min(22, blockW*0.5))}px monospace`;
+            ctx.fillStyle = "rgba(35,18,0,0.92)";
+            ctx.textAlign = "center"; ctx.textBaseline = "middle";
+            ctx.fillText(whiteKeyLetter(k), cx, by);
+          }
+        }
+
         // ── debug readout (drawn into each eye) ───────────────────────────────
         {
           const fc  = msg?.fsr_connected || { right: false };
@@ -327,7 +521,7 @@ export default function Render() {
           ctx.fillText(txt, vp.x + vp.w - 12, vp.y + 12);
         }
 
-        // ── hand skeleton ─────────────────────────────────────────────────────
+        // ── hand skeleton (drawn LAST = on top of keys + falling notes) ────────
         const hands = msg?.hands || [];
         for (const hand of hands) {
           const lm = hand.landmarks;
@@ -376,7 +570,6 @@ export default function Render() {
   return (
     <div style={{ position: "fixed", inset: 0, background: "#000",
                   overflow: "hidden", touchAction: "none" }}>
-      {/* kill document-level scroll / pan / rubber-band on mobile */}
       <style>{`
         html, body {
           margin: 0; padding: 0;
@@ -388,7 +581,6 @@ export default function Render() {
         }
       `}</style>
 
-      {/* camera is the frame source only — never shown directly (canvas draws both eyes) */}
       <Webcam
         ref={webcamRef}
         audio={false}
@@ -417,19 +609,38 @@ export default function Render() {
         {connected ? `${ping ?? "–"}ms` : "connecting…"}
       </span>
 
-      {/* re-enter fullscreen if the address bar comes back (e.g. after rotating) */}
+      {/* normal UI tutorial button, top-left (appears after audio is unlocked) */}
       {started && (
         <button
-          onClick={goFullscreen}
+          onClick={beginCountdown}
+          disabled={countdown !== null}
           style={{
-            position: "absolute", top: 10, left: "50%", transform: "translateX(-50%)",
-            fontFamily: "monospace", fontSize: 14, padding: "6px 14px",
-            borderRadius: 999, border: "none", cursor: "pointer", zIndex: 5,
-            background: "rgba(20,30,40,0.8)", color: "white",
+            position: "absolute", top: 44, left: 16, zIndex: 10,
+            padding: "8px 14px", borderRadius: 10, border: "none",
+            background: countdown !== null ? "rgba(120,60,200,0.55)"
+                                           : "rgba(120,60,200,0.95)",
+            color: "white", fontFamily: "monospace", fontSize: 14,
+            cursor: countdown !== null ? "default" : "pointer",
           }}
         >
-          ⛶ Fullscreen
+          {countdown !== null ? `Starting in ${countdown}…` : "Start Tutorial"}
         </button>
+      )}
+
+      {/* big centred countdown number */}
+      {countdown !== null && (
+        <div style={{
+          position: "absolute", inset: 0, display: "flex",
+          alignItems: "center", justifyContent: "center", pointerEvents: "none",
+        }}>
+          <span style={{
+            fontFamily: "monospace", fontSize: 120, fontWeight: "bold",
+            color: "rgba(255,255,255,0.92)",
+            textShadow: "0 2px 18px rgba(0,0,0,0.65)",
+          }}>
+            {countdown}
+          </span>
+        </div>
       )}
 
       {/* one-tap overlay: unlocks audio, hides the address bar, starts the demo */}
